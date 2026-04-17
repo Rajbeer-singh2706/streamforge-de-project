@@ -53,3 +53,31 @@ services:
       interval: 15s
       timeout: 10s
       retries: 10
+
+  # ─── Kafka Topic Init ────────────────────────────────────────
+  kafka-init:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: sf_kafka_init
+    networks: [streamforge]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./scripts/create_topics.sh:/create_topics.sh
+    command: ["bash", "/create_topics.sh"]
+    restart: on-failure
+
+  # ─── Kafka UI ────────────────────────────────────────────────
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: sf_kafka_ui
+    networks: [streamforge]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: streamforge-local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
