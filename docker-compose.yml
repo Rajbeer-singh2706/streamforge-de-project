@@ -4,12 +4,12 @@ networks:
   streamforge:
     driver: bridge
 
+
 volumes:
   postgres_data:
   kafka_data:
 
 services:
-
   # ─── Zookeeper ───────────────────────────────────────────────
   zookeeper:
     image: confluentinc/cp-zookeeper:7.5.0
@@ -23,7 +23,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-
+      
   # ─── Kafka Broker ────────────────────────────────────────────
   kafka:
     image: confluentinc/cp-kafka:7.5.0
@@ -54,72 +54,3 @@ services:
       interval: 15s
       timeout: 10s
       retries: 10
-
-  # ─── Kafka Topic Init ────────────────────────────────────────
-  kafka-init:
-    image: confluentinc/cp-kafka:7.5.0
-    container_name: sf_kafka_init
-    networks: [streamforge]
-    depends_on:
-      kafka:
-        condition: service_healthy
-    volumes:
-      - ./scripts/create_topics.sh:/create_topics.sh
-    command: ["bash", "/create_topics.sh"]
-    restart: on-failure
-
-  # ─── Kafka UI ────────────────────────────────────────────────
-  kafka-ui:
-    image: provectuslabs/kafka-ui:latest
-    container_name: sf_kafka_ui
-    networks: [streamforge]
-    depends_on:
-      kafka:
-        condition: service_healthy
-    ports:
-      - "8080:8080"
-    environment:
-      KAFKA_CLUSTERS_0_NAME: streamforge-local
-      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
-      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
-
-  # ─── PostgreSQL ──────────────────────────────────────────────
-  postgres:
-    image: postgres:15-alpine
-    container_name: sf_postgres
-    networks: [streamforge]
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql
-    ports:
-      - "5432:5432"
-    environment:
-      POSTGRES_DB: streamforge
-      POSTGRES_USER: sfuser
-      POSTGRES_PASSWORD: sfpassword
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U sfuser -d streamforge"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  # ─── Event Producer Service ──────────────────────────────────
-  producer:
-    build:
-      context: ./producer
-      dockerfile: Dockerfile
-    container_name: sf_producer
-    networks: [streamforge]
-    depends_on:
-      kafka:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
-    volumes:
-      - ./producer:/app
-    environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      POSTGRES_DSN: postgresql://sfuser:sfpassword@postgres:5432/streamforge
-      LOG_LEVEL: INFO
-    command: ["python", "producer.py", "--mode", "simulate"]
-    restart: on-failure
