@@ -4,7 +4,6 @@ networks:
   streamforge:
     driver: bridge
 
-
 volumes:
   postgres_data:
   kafka_data:
@@ -23,7 +22,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      
+  
   # ─── Kafka Broker ────────────────────────────────────────────
   kafka:
     image: confluentinc/cp-kafka:7.5.0
