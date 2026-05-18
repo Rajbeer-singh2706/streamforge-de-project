@@ -1,1 +1,27 @@
-#.env.exmaple
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+venv/
+.venv/
+
+# Secrets — NEVER commit these
+.env
+*.pem
+*.key
+credentials.json
+*_credentials.*
+
+# Docker local state
+docker-volumes/
+*.log
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
