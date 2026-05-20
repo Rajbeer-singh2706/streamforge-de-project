@@ -4,7 +4,7 @@ set -e
 BROKER="kafka:29092"
 PARTITIONS=3
 REPLICATION=1
-RETENTION_MS=604800000 # 7 days
+RETENTION_MS=604800000
 
 echo "==> Waiting for Kafka..."
 sleep 5

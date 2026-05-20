@@ -95,10 +95,10 @@ services:
       timeout: 5s
       retries: 5
 
-  producer:      # Day 6
-    build: ./producer
-    networks: [streamforge]
+  # producer:      # Day 6
+  #   build: src/producer
+  #   networks: [streamforge]
 
-  consumer:      # Day 11
-    build: ./consumer
-    networks: [streamforge]
+  # consumer:      # Day 11
+  #   build: src/consumer
+  #   networks: [streamforge]
