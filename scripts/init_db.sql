@@ -134,3 +134,4 @@ JOIN customers c ON c.id = s.customer_id
 LEFT JOIN lifecycle_events le ON le.subscription_id = s.id
 GROUP BY s.id, c.email, c.name, s.plan,
          s.status, s.expires_at, s.amount_usd;
+
