@@ -65,12 +65,35 @@ services:
 
   kafka-ui:      # Day 3
     image: provectuslabs/kafka-ui:latest
+    container_name: sf_kafka_ui
     networks: [streamforge]
+    depends_on:
+      kafka:
+        condition: service_healthy
     ports: ["8080:8080"]
-
+    environment:
+      KAFKA_CLUSTERS_0_NAME: streamforge-local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+      
   postgres:      # Day 3
     image: postgres:15-alpine
+    container_name: sf_postgres
     networks: [streamforge]
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql
+    ports:
+      - "5432:5432" 
+    environment:
+      POSTGRES_DB: streamforge
+      POSTGRES_USER: sfuser
+      POSTGRES_PASSWORD: sfpassword
+    healthcheck:
+      test: ["CMD-SHELL","pg_isready -U sfuser -d streamforge"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   producer:      # Day 6
     build: ./producer
