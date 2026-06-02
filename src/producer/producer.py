@@ -185,7 +185,7 @@ class FakeDataFactory:
             amount_usd=Decimal(str(PLAN_PRICES[plan])),
             expires_at=(now + timedelta(days=sub_duration)).isoformat(),
             auto_renew=random.choice([True, True, False]),  # 2:1 favour auto-renew
-            source=random.choice(["web", "mobile_ios", "mobile_android", "partner"]),
+            source=random.choice(["web", "mobile", "cs_portal", "partner"]),
         )
 
     def renewal(self) -> RenewalEvent:
@@ -225,8 +225,8 @@ class FakeDataFactory:
                 entry["subscription_id"], "cancellation", now
             ),
             reason=random.choice([
-                "too_expensive", "not_needed", "switching_product",
-                "poor_support", "technical_issues", "other",
+                "user_requested", "payment_failure", "cs_initiated",
+                "fraud", "duplicate", "other",
             ]),
             cancelled_by=random.choice(["customer", "cs_agent"]),
             effective_date=now.isoformat(),
@@ -255,8 +255,8 @@ class FakeDataFactory:
             refund_amount=refund_amount,
             original_amount=original,
             reason=random.choice([
-                "customer_request", "billing_error", "product_defect",
-                "duplicate_charge", "cs_goodwill",
+                "cancellation", "billing_error", "duplicate_charge",
+                "cs_goodwill", "chargeback", "other",
             ]),
             initiated_by=random.choice([
                 "customer", "cs_agent:1001", "cs_agent:1042", "billing_system",
@@ -302,8 +302,8 @@ class FakeDataFactory:
             previous_expiry=prev_expiry.isoformat(),
             new_expiry=new_expiry.isoformat(),
             reason=random.choice([
-                "cs_goodwill", "service_outage", "billing_failure",
-                "promotional", "technical_error",
+                "goodwill", "service_outage", "promo_code",
+                "payment_grace", "cs_reinstatement", "other",
             ]),
             extended_by=random.choice([
                 "cs_agent:1001", "cs_agent:1042", "cs_agent:2099",
