@@ -7,3 +7,4 @@ faker==24.0.0
 
 # Shared schemas import pydantic — version must match shared/
 pydantic>=2.0.0
+
