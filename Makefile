@@ -1,4 +1,4 @@
-.PHONY: start down restart logs ps clean db-shell
+.PHONY: start stop restart logs ps clean db-shell produce-once produce-single logs-producer
 
 start:
 	docker-compose up -d
@@ -13,12 +13,6 @@ clean:
 logs:
 	docker-compose logs -f
 
-logs-producer:
-	docker-compose logs -f producer
-
-logs-consumer:
-	docker-compose logs -f consumer
-
 ps:
 	docker-compose ps
 
@@ -31,3 +25,21 @@ kafka-shell:
 topics:
 	docker exec sf_kafka kafka-topics \
 	  --bootstrap-server localhost:29092 --list
+
+## Emit one of each event type and exit (smoke test helper)
+produce-once:
+	docker compose run --rm producer \
+		python producer/producer.py --mode once
+ 
+## Emit one specific event type and exit
+## Usage: make produce-single EVENT=renewal
+produce-single:
+ifndef EVENT
+	$(error EVENT is required. Usage: make produce-single EVENT=renewal)
+endif
+	docker compose run --rm producer \
+		python producer/producer.py --mode single --event $(EVENT)
+ 
+## Tail producer logs only
+logs-producer:
+	docker compose logs -f producer

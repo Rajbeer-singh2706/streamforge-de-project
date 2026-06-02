@@ -1,87 +1,55 @@
 """
 StreamForge Kafka Producer
-===========================
+==========================
 Generates realistic subscription lifecycle events and publishes them to Kafka.
 
-Three operating modes
----------------------
-  simulate   Infinite loop. One random event every SIMULATE_INTERVAL_SEC.
-             This is the default mode when the container starts via docker-compose.
-             Use it to keep Kafka populated while you develop the consumer.
+Three operating modes (--mode flag):
+  simulate  — infinite loop, one random event every SIMULATE_INTERVAL_SEC (default)
+  once      — emit one of each of the 6 event types, then exit cleanly
+  single    — emit one specific event type (--event <type>), then exit cleanly
 
-  once       Emits exactly one of each event type (6 messages total) then exits.
-             Used by `make produce-once` for smoke tests and CI.
-
-  single     Emits one event of a specific type then exits.
-             Used by `make produce-single EVENT=renewal` for targeted testing.
-
-Design decisions
-----------------
-
-1.  Event construction uses real Pydantic models from shared.schemas.
-    The producer never hand-crafts JSON.  Every message is validated by
-    Pydantic before it reaches Kafka.  If a schema field is wrong, the
-    error surfaces here — not in the consumer after the message is stored.
-
-2.  Deterministic idempotency_key.
-    The default idempotency_key in BaseEvent is a random uuid4 — fine for
-    simulate mode where we deliberately want variety.  For once and single
-    modes we set a deterministic key so re-running the command is idempotent:
-    the consumer will skip duplicates rather than inserting them twice.
-    Format: "{event_type}:{subscription_id}:{date}"
-
-3.  Delivery callback instead of poll(timeout=0).
-    confluent-kafka is async by default.  producer.produce() enqueues the
-    message in the local buffer; the broker ACK arrives later.  The delivery
-    callback is the only reliable way to know if a message was actually
-    stored.  On error we log and increment a counter; we don't crash —
-    the simulate loop will retry on the next iteration.
-
-4.  producer.flush() before exit.
-    The local buffer may hold unsent messages when the process exits.
-    flush() blocks until all buffered messages are delivered or timeout
-    is reached.  Without it, the last batch of messages in once/single
-    mode would be silently dropped.
-
-5.  Faker seeds realistic but fake data.
-    UUIDs are genuinely random per-run.  Names, emails, dates come from
-    Faker so log output looks like real data — easier to reason about
-    during development than "sub_001", "sub_002".
-
-6.  Signal handling for graceful shutdown in simulate mode.
-    SIGTERM (sent by `docker-compose stop`) sets a threading.Event.
-    The main loop checks this event between iterations so the current
-    message completes before exit — no partial writes.
-
-7.  All log calls use get_logger from shared.logger.
-    Every line is structured JSON.  The delivery callback logs at INFO
-    on success, ERROR on failure.  The main loop logs at DEBUG for
-    individual produce calls and INFO for batch completions.
+Design principles:
+  - FakeDataFactory holds shared UUID pools so events reference consistent
+    subscription/customer IDs across simulate mode (renewals reference subs
+    that were "created", not random orphans).
+  - Weighted event distribution mirrors real antivirus SaaS traffic patterns.
+  - Deterministic idempotency_key = sha256(sub_id + event_type + date) so
+    producer restarts don't create phantom duplicates in the consumer.
+  - Delivery callback on every produce() call — async Kafka produce means
+    produce() returns before the broker ACKs; the callback is the only way
+    to detect send failures.
+  - poll(0) drains the callback queue in the simulate loop without blocking.
+  - flush() after once/single ensures all in-flight messages are delivered
+    before the process exits (avoids silent message loss on clean exit).
 """
 
-from __future__ import annotations
-
 import argparse
+import hashlib
 import os
 import random
 import signal
 import sys
-import threading
 import time
-import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from typing import Optional
+from uuid import uuid4
 
-# ── Path setup ────────────────────────────────────────────────────────────────
-# In the Docker image WORKDIR=/app and we COPY shared/ → /app/shared/,
-# so `import shared` works without modification.
-# For local runs (python src/producer/producer.py) we need src/ on the path.
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+from confluent_kafka import Producer, KafkaException
+from faker import Faker
+
+# ---------------------------------------------------------------------------
+# Path bootstrap: allow `from shared.X import Y` when running inside Docker
+# (WORKDIR /app, shared lives at /app/shared/) or locally from repo root.
+# ---------------------------------------------------------------------------
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from faker import Faker
-from confluent_kafka import Producer, KafkaException
-
+from shared.constants import (
+    TOPIC_MAP,
+    PLANS,
+    PLAN_PRICES,
+    CONSUMER_GROUP_ID,
+)
 from shared.schemas import (
     NewSubscriptionEvent,
     RenewalEvent,
@@ -91,239 +59,339 @@ from shared.schemas import (
     ExtensionEvent,
     BaseEvent,
 )
-from shared.constants import TOPIC_MAP, PLANS, PLAN_PRICES
-from shared.logger import get_logger, log_kafka_processed, log_dlq_routed
+from shared.logger import get_logger, log_kafka_processed
 
-# ── Module-level singletons ───────────────────────────────────────────────────
-logger = get_logger("producer")
-fake   = Faker()
-Faker.seed(0)   # reproducible names/emails across restarts in simulate mode
+# ---------------------------------------------------------------------------
+# Globals
+# ---------------------------------------------------------------------------
+logger = get_logger("producer", service="producer")
+fake = Faker()
 
-# ── Shutdown signal ───────────────────────────────────────────────────────────
-_shutdown = threading.Event()
+# Weighted distribution: mirrors real antivirus SaaS event ratios.
+# renewals >> new_subscriptions >> expiry ≈ cancellation > refund > extension
+EVENT_WEIGHTS: list[tuple[str, int]] = [
+    ("renewal",          40),
+    ("new_subscription", 25),
+    ("expiry",           15),
+    ("cancellation",     10),
+    ("refund",            7),
+    ("extension",         3),
+]
+EVENT_TYPES  = [e for e, _ in EVENT_WEIGHTS]
+WEIGHTS      = [w for _, w in EVENT_WEIGHTS]
 
-def _handle_sigterm(signum, frame):          # noqa: ANN001
-    logger.info("SIGTERM received — draining and shutting down")
-    _shutdown.set()
-
-signal.signal(signal.SIGTERM, _handle_sigterm)
-signal.signal(signal.SIGINT,  _handle_sigterm)
-
-
-# =============================================================================
-# Fake data helpers
-# =============================================================================
-
-def _sub_id()    -> str: return str(uuid.uuid4())
-def _cust_id()   -> str: return str(uuid.uuid4())
-def _txn_id()    -> str: return str(uuid.uuid4())
-def _now()       -> datetime: return datetime.now(timezone.utc)
-def _future(days: int = 30) -> datetime: return _now() + timedelta(days=days)
-def _past(days: int = 30)   -> datetime: return _now() - timedelta(days=days)
-def _plan()      -> str: return random.choice(PLANS)
-def _amount(plan: str) -> Decimal:
-    base = Decimal(str(PLAN_PRICES[plan]))
-    # Small realistic variation: ±$0.01 for currency conversion, prorating etc.
-    variation = Decimal(str(round(random.uniform(-0.01, 0.01), 2)))
-    return max(Decimal("0.01"), base + variation)
+# Shutdown flag: set by SIGTERM/SIGINT handler so simulate loop exits cleanly
+_shutdown = False
 
 
-# =============================================================================
-# Event factory functions — one per event type
-# =============================================================================
+def _handle_signal(signum: int, frame) -> None:  # noqa: ANN001
+    global _shutdown
+    logger.info("Shutdown signal received — draining producer and exiting")
+    _shutdown = True
 
-def make_new_subscription(sub_id: str | None = None, cust_id: str | None = None) -> NewSubscriptionEvent:
+
+signal.signal(signal.SIGTERM, _handle_signal)
+signal.signal(signal.SIGINT,  _handle_signal)
+
+
+# ---------------------------------------------------------------------------
+# FakeDataFactory
+# ---------------------------------------------------------------------------
+class FakeDataFactory:
     """
-    Build a realistic NewSubscriptionEvent.
+    Maintains pools of UUIDs so simulate mode produces correlated events.
 
-    sub_id and cust_id can be passed in when you want correlated events
-    (e.g. produce a new_subscription followed by a renewal for the same sub).
+    Without this, every event would reference a random UUID that has never
+    been seen before, making the event stream incoherent (renewals for subs
+    that don't exist, refunds with no prior transaction, etc.).
+
+    The factory pre-generates POOL_SIZE customer + subscription pairs on
+    init. Subsequent event builders draw from the same pool, so events
+    for the same subscription_id are naturally correlated.
     """
-    sub_id  = sub_id  or _sub_id()
-    cust_id = cust_id or _cust_id()
-    plan    = _plan()
-    return NewSubscriptionEvent(
-        subscription_id  = sub_id,
-        customer_id      = cust_id,
-        idempotency_key  = f"new_subscription:{sub_id}:{_now().date()}",
-        plan             = plan,
-        amount_usd       = _amount(plan),
-        expires_at       = _future(30).isoformat(),
-        auto_renew       = random.choice([True, True, True, False]),  # 75% auto-renew
-        source           = random.choice(["web", "web", "mobile", "cs_portal"]),
-    )
+
+    POOL_SIZE = 200  # large enough to avoid always hitting the same sub
+
+    def __init__(self) -> None:
+        # Pre-generate customer ↔ subscription pairs
+        self._pool: list[dict] = [
+            {
+                "customer_id":    str(uuid4()),
+                "subscription_id": str(uuid4()),
+                "plan":           random.choice(PLANS),
+            }
+            for _ in range(self.POOL_SIZE)
+        ]
+        # Track "active" transaction IDs for realistic refund events
+        self._transaction_ids: list[str] = [str(uuid4()) for _ in range(50)]
+
+    def _pick(self) -> dict:
+        """Return a random entry from the pool."""
+        return random.choice(self._pool)
+
+    @staticmethod
+    def _idempotency_key(subscription_id: str, event_type: str, occurred_at: datetime) -> str:
+        """
+        Deterministic idempotency key.
+
+        Formula: sha256(subscription_id + "|" + event_type + "|" + YYYY-MM-DD)
+
+        Why sha256 instead of a format string?
+        - Fixed length (64 hex chars) regardless of input variance
+        - Collision-resistant: two different (sub, type, date) triples never
+          produce the same key
+        - Not guessable: prevents accidental key collisions if field values
+          happen to share substrings
+
+        Why day-level granularity?
+        - One renewal per sub per day is the realistic business constraint.
+          Finer granularity (hour/minute) would generate new keys on restarts
+          and defeat idempotency. Coarser (month) would reject legitimate
+          same-month re-subscriptions after a cancellation.
+        """
+        date_str = occurred_at.strftime("%Y-%m-%d")
+        raw = f"{subscription_id}|{event_type}|{date_str}"
+        return hashlib.sha256(raw.encode()).hexdigest()
+
+    def _now(self) -> datetime:
+        return datetime.now(timezone.utc)
+
+    def _future(self, days: int = 30) -> datetime:
+        return self._now() + timedelta(days=days)
+
+    def _past(self, days: int = 30) -> datetime:
+        return self._now() - timedelta(days=days)
+
+    # ------------------------------------------------------------------
+    # One builder per event type
+    # ------------------------------------------------------------------
+
+    def new_subscription(self) -> NewSubscriptionEvent:
+        entry = self._pick()
+        plan  = entry["plan"]
+        now   = self._now()
+        sub_duration = random.choice([30, 90, 365])
+        return NewSubscriptionEvent(
+            event_id=str(uuid4()),
+            event_type="new_subscription",
+            event_version="1.0",
+            occurred_at=now.isoformat(),
+            subscription_id=entry["subscription_id"],
+            customer_id=entry["customer_id"],
+            idempotency_key=self._idempotency_key(
+                entry["subscription_id"], "new_subscription", now
+            ),
+            plan=plan,
+            amount_usd=Decimal(str(PLAN_PRICES[plan])),
+            expires_at=(now + timedelta(days=sub_duration)).isoformat(),
+            auto_renew=random.choice([True, True, False]),  # 2:1 favour auto-renew
+            source=random.choice(["web", "mobile_ios", "mobile_android", "partner"]),
+        )
+
+    def renewal(self) -> RenewalEvent:
+        entry = self._pick()
+        plan  = entry["plan"]
+        now   = self._now()
+        prev_expiry = self._past(days=random.randint(0, 2))
+        new_expiry  = prev_expiry + timedelta(days=random.choice([30, 90, 365]))
+        return RenewalEvent(
+            event_id=str(uuid4()),
+            event_type="renewal",
+            event_version="1.0",
+            occurred_at=now.isoformat(),
+            subscription_id=entry["subscription_id"],
+            customer_id=entry["customer_id"],
+            idempotency_key=self._idempotency_key(
+                entry["subscription_id"], "renewal", now
+            ),
+            plan=plan,
+            amount_usd=Decimal(str(PLAN_PRICES[plan])),
+            previous_expiry=prev_expiry.isoformat(),
+            new_expiry=new_expiry.isoformat(),
+            renewal_attempt=random.randint(1, 3),
+        )
+
+    def cancellation(self) -> CancellationEvent:
+        entry = self._pick()
+        now   = self._now()
+        return CancellationEvent(
+            event_id=str(uuid4()),
+            event_type="cancellation",
+            event_version="1.0",
+            occurred_at=now.isoformat(),
+            subscription_id=entry["subscription_id"],
+            customer_id=entry["customer_id"],
+            idempotency_key=self._idempotency_key(
+                entry["subscription_id"], "cancellation", now
+            ),
+            reason=random.choice([
+                "too_expensive", "not_needed", "switching_product",
+                "poor_support", "technical_issues", "other",
+            ]),
+            cancelled_by=random.choice(["customer", "cs_agent"]),
+            effective_date=now.isoformat(),
+            refund_eligible=random.choice([True, False]),
+        )
+
+    def refund(self) -> RefundEvent:
+        entry = self._pick()
+        plan  = entry["plan"]
+        now   = self._now()
+        original = Decimal(str(PLAN_PRICES[plan]))
+        # Partial refunds are common; pro-rate up to the full original amount
+        refund_pct    = random.choice([Decimal("0.25"), Decimal("0.50"), Decimal("1.00")])
+        refund_amount = (original * refund_pct).quantize(Decimal("0.01"))
+        return RefundEvent(
+            event_id=str(uuid4()),
+            event_type="refund",
+            event_version="1.0",
+            occurred_at=now.isoformat(),
+            subscription_id=entry["subscription_id"],
+            customer_id=entry["customer_id"],
+            idempotency_key=self._idempotency_key(
+                entry["subscription_id"], "refund", now
+            ),
+            transaction_id=random.choice(self._transaction_ids),
+            refund_amount=refund_amount,
+            original_amount=original,
+            reason=random.choice([
+                "customer_request", "billing_error", "product_defect",
+                "duplicate_charge", "cs_goodwill",
+            ]),
+            initiated_by=random.choice([
+                "customer", "cs_agent:1001", "cs_agent:1042", "billing_system",
+            ]),
+        )
+
+    def expiry(self) -> ExpiryEvent:
+        entry = self._pick()
+        plan  = entry["plan"]
+        now   = self._now()
+        return ExpiryEvent(
+            event_id=str(uuid4()),
+            event_type="expiry",
+            event_version="1.0",
+            occurred_at=now.isoformat(),
+            subscription_id=entry["subscription_id"],
+            customer_id=entry["customer_id"],
+            idempotency_key=self._idempotency_key(
+                entry["subscription_id"], "expiry", now
+            ),
+            plan=plan,
+            expired_at=now.isoformat(),
+            auto_renew=False,  # by definition: if auto_renew=True it would have renewed
+        )
+
+    def extension(self) -> ExtensionEvent:
+        entry = self._pick()
+        now   = self._now()
+        prev_expiry = self._future(days=random.randint(0, 7))
+        extend_days = random.choice([7, 14, 30])
+        new_expiry  = prev_expiry + timedelta(days=extend_days)
+        return ExtensionEvent(
+            event_id=str(uuid4()),
+            event_type="extension",
+            event_version="1.0",
+            occurred_at=now.isoformat(),
+            subscription_id=entry["subscription_id"],
+            customer_id=entry["customer_id"],
+            idempotency_key=self._idempotency_key(
+                entry["subscription_id"], "extension", now
+            ),
+            extended_by_days=extend_days,
+            previous_expiry=prev_expiry.isoformat(),
+            new_expiry=new_expiry.isoformat(),
+            reason=random.choice([
+                "cs_goodwill", "service_outage", "billing_failure",
+                "promotional", "technical_error",
+            ]),
+            extended_by=random.choice([
+                "cs_agent:1001", "cs_agent:1042", "cs_agent:2099",
+            ]),
+        )
+
+    def build(self, event_type: str) -> BaseEvent:
+        """Dispatch to the correct builder by event_type string."""
+        builders = {
+            "new_subscription": self.new_subscription,
+            "renewal":          self.renewal,
+            "cancellation":     self.cancellation,
+            "refund":           self.refund,
+            "expiry":           self.expiry,
+            "extension":        self.extension,
+        }
+        if event_type not in builders:
+            raise ValueError(
+                f"Unknown event_type '{event_type}'. "
+                f"Valid: {sorted(builders)}"
+            )
+        return builders[event_type]()
+
+    def random_weighted(self) -> BaseEvent:
+        """
+        Pick an event type using the weighted distribution and build it.
+
+        random.choices() with weights is the cleanest stdlib approach:
+        no need to normalise to probabilities — the raw integers work as-is.
+        """
+        [event_type] = random.choices(EVENT_TYPES, weights=WEIGHTS, k=1)
+        return self.build(event_type)
 
 
-def make_renewal(sub_id: str | None = None, cust_id: str | None = None) -> RenewalEvent:
-    sub_id   = sub_id  or _sub_id()
-    cust_id  = cust_id or _cust_id()
-    plan     = _plan()
-    prev_exp = _past(1)
-    new_exp  = _future(29)
-    return RenewalEvent(
-        subscription_id  = sub_id,
-        customer_id      = cust_id,
-        idempotency_key  = f"renewal:{sub_id}:{_now().date()}",
-        plan             = plan,
-        amount_usd       = _amount(plan),
-        previous_expiry  = prev_exp.isoformat(),
-        new_expiry       = new_exp.isoformat(),
-        renewal_attempt  = random.choices([1, 2, 3], weights=[85, 12, 3])[0],
-    )
+# ---------------------------------------------------------------------------
+# Kafka producer helpers
+# ---------------------------------------------------------------------------
 
-
-def make_cancellation(sub_id: str | None = None, cust_id: str | None = None) -> CancellationEvent:
-    sub_id  = sub_id  or _sub_id()
-    cust_id = cust_id or _cust_id()
-    cs_initiated = random.random() < 0.15   # 15% CS-initiated
-    return CancellationEvent(
-        subscription_id  = sub_id,
-        customer_id      = cust_id,
-        idempotency_key  = f"cancellation:{sub_id}:{_now().date()}",
-        reason           = random.choice([
-            "user_requested", "user_requested", "user_requested",
-            "payment_failure", "cs_initiated", "other",
-        ]),
-        cancelled_by     = f"cs_agent:{random.randint(1,50)}" if cs_initiated else "user",
-        effective_date   = _future(random.choice([0, 0, 30])).isoformat(),
-        refund_eligible  = cs_initiated,
-    )
-
-
-def make_refund(sub_id: str | None = None, cust_id: str | None = None) -> RefundEvent:
-    sub_id   = sub_id  or _sub_id()
-    cust_id  = cust_id or _cust_id()
-    plan     = _plan()
-    original = _amount(plan)
-    # Partial refund 70% of the time, full refund 30%
-    refund   = (original * Decimal("0.5")).quantize(Decimal("0.01")) \
-               if random.random() < 0.7 else original
-    txn_id   = _txn_id()
-    return RefundEvent(
-        subscription_id  = sub_id,
-        customer_id      = cust_id,
-        idempotency_key  = f"refund:{txn_id}",
-        transaction_id   = txn_id,
-        refund_amount    = refund,
-        original_amount  = original,
-        reason           = random.choice([
-            "cancellation", "billing_error", "cs_goodwill",
-            "duplicate_charge", "chargeback",
-        ]),
-        initiated_by     = f"cs_agent:{random.randint(1,50)}",
-    )
-
-
-def make_expiry(sub_id: str | None = None, cust_id: str | None = None) -> ExpiryEvent:
-    sub_id  = sub_id  or _sub_id()
-    cust_id = cust_id or _cust_id()
-    return ExpiryEvent(
-        subscription_id  = sub_id,
-        customer_id      = cust_id,
-        idempotency_key  = f"expiry:{sub_id}:{_now().date()}",
-        plan             = _plan(),
-        expired_at       = _now().isoformat(),
-        auto_renew       = random.choice([True, False]),
-    )
-
-
-def make_extension(sub_id: str | None = None, cust_id: str | None = None) -> ExtensionEvent:
-    sub_id   = sub_id  or _sub_id()
-    cust_id  = cust_id or _cust_id()
-    days     = random.choice([7, 14, 30])
-    prev_exp = _future(0)
-    new_exp  = prev_exp + timedelta(days=days)
-    return ExtensionEvent(
-        subscription_id  = sub_id,
-        customer_id      = cust_id,
-        idempotency_key  = f"extension:{sub_id}:{_now().date()}",
-        extended_by_days = days,
-        previous_expiry  = prev_exp.isoformat(),
-        new_expiry       = new_exp.isoformat(),
-        reason           = random.choice(["goodwill", "service_outage", "promo_code", "cs_reinstatement"]),
-        extended_by      = f"cs_agent:{random.randint(1,50)}",
-    )
-
-
-# Map event_type string → factory function.
-# Used by simulate and single modes to build events without if/elif chains.
-EVENT_FACTORIES = {
-    "new_subscription": make_new_subscription,
-    "renewal":          make_renewal,
-    "cancellation":     make_cancellation,
-    "refund":           make_refund,
-    "expiry":           make_expiry,
-    "extension":        make_extension,
-}
-
-
-# =============================================================================
-# Kafka producer setup
-# =============================================================================
-
-def build_kafka_producer(bootstrap_servers: str) -> Producer:
+def _make_producer(bootstrap_servers: str) -> Producer:
     """
-    Create and return a confluent-kafka Producer.
+    Create a confluent_kafka.Producer with production-appropriate settings.
 
     Key config choices:
-    - acks=all          Every in-sync replica must confirm the write before
-                        the broker ACKs.  Strongest durability guarantee.
-                        Cost: ~5-10 ms extra latency on each produce.
-    - retries=5         Retry transient broker errors (leader election,
-                        network blip) up to 5 times.
-    - linger.ms=10      Buffer messages for up to 10 ms before sending.
-                        Allows the client to batch multiple events into one
-                        network request.  At 300M events/day this cuts
-                        network overhead dramatically.
-    - compression.type  snappy gives ~3-5x compression on JSON with very
-                        low CPU cost.  Reduces broker disk usage and
-                        replication bandwidth.
-    - enable.idempotence=true
-                        Prevents duplicate messages from retries.
-                        Requires acks=all and retries > 0.
+      acks=all          — wait for all in-sync replicas to ACK (durability).
+                          In local single-broker Docker this is equivalent to
+                          acks=1 but keeps the config correct for MSK migration.
+      retries=3         — transient broker errors auto-retry without our
+                          involvement; delivery callback still fires on final fail.
+      linger.ms=5       — batch messages for up to 5ms before sending.
+                          Tiny latency cost; significant throughput gain during
+                          bursts (hundreds of events in a short window).
+      compression.type  — lz4 is fast CPU-wise and gives ~3-5× size reduction
+                          on JSON payloads. Important at 300M-sub scale.
     """
     return Producer({
-        "bootstrap.servers":   bootstrap_servers,
-        "acks":                "all",
-        "retries":             5,
-        "retry.backoff.ms":    300,
-        "linger.ms":           10,
-        "compression.type":    "snappy",
-        "enable.idempotence":  True,
-        # Delivery report queue size — limits memory for unACKed messages
-        "queue.buffering.max.messages": 100_000,
+        "bootstrap.servers":  bootstrap_servers,
+        "acks":               "all",
+        "retries":            3,
+        "linger.ms":          5,
+        "compression.type":   "lz4",
+        "client.id":          "streamforge-producer",
     })
-
-
-# =============================================================================
-# Core produce function
-# =============================================================================
-
-# Track delivery stats across the session
-_stats = {"produced": 0, "delivered": 0, "errors": 0}
 
 
 def _delivery_callback(err, msg) -> None:
     """
-    Called by confluent-kafka for every message once the broker ACKs (or fails).
+    Called by confluent_kafka after every produce() settles.
 
-    This runs in the librdkafka background thread — do NOT block here.
-    We update counters and log; no heavy computation.
+    Why not just check the return value of produce()?
+    produce() is non-blocking — it enqueues the message internally and
+    returns immediately. The actual send happens on a background thread.
+    The delivery callback is the only reliable notification mechanism.
+
+    We log both success and failure so the structured logs feed into
+    CloudWatch metrics (Day 26) without any extra instrumentation.
     """
     if err:
-        _stats["errors"] += 1
         logger.error(
-            "delivery failed",
+            "Kafka delivery failed",
             extra={
-                "topic": msg.topic(),
+                "topic":     msg.topic(),
                 "partition": msg.partition(),
-                "error": str(err),
+                "error":     str(err),
             },
         )
     else:
-        _stats["delivered"] += 1
         logger.debug(
-            "delivery confirmed",
+            "Kafka delivery confirmed",
             extra={
                 "topic":     msg.topic(),
                 "partition": msg.partition(),
@@ -334,108 +402,156 @@ def _delivery_callback(err, msg) -> None:
 
 def produce_event(producer: Producer, event: BaseEvent) -> None:
     """
-    Validate, serialise, and enqueue one event for delivery to Kafka.
+    Serialize and publish a single event to its canonical topic.
 
-    The actual network send happens asynchronously in librdkafka's
-    background thread.  Call producer.flush() to wait for all ACKs.
+    Partition key = event.kafka_key() = subscription_id encoded as bytes.
+    This guarantees all events for the same subscription land on the same
+    partition, preserving ordering for the consumer state machine (Day 8).
     """
     topic = TOPIC_MAP[event.event_type]
-    _stats["produced"] += 1
-
+    t0    = time.perf_counter()
     try:
         producer.produce(
-            topic    = topic,
-            key      = event.kafka_key(),
-            value    = event.to_kafka_payload(),
-            callback = _delivery_callback,
+            topic=topic,
+            key=event.kafka_key(),
+            value=event.to_kafka_payload(),
+            on_delivery=_delivery_callback,
         )
-        # poll(0) gives librdkafka a chance to call delivery callbacks
-        # for messages that were already ACKed.  Without this the callback
-        # queue can back up and BufferError is raised when the buffer fills.
-        producer.poll(0)
-
-        logger.info(
-            "event produced",
+        duration_ms = (time.perf_counter() - t0) * 1000
+        log_kafka_processed(
+            logger,
+            event_type=event.event_type,
+            event_id=event.event_id,
+            subscription_id=event.subscription_id,
+            duration_ms=round(duration_ms, 2),
+            success=True,
+        )
+    except KafkaException as exc:
+        logger.error(
+            "produce() raised KafkaException",
             extra={
-                "event_type":      event.event_type,
-                "event_id":        event.event_id,
-                "subscription_id": event.subscription_id,
-                "topic":           topic,
-                "idempotency_key": event.idempotency_key,
+                "event_type": event.event_type,
+                "event_id":   event.event_id,
+                "error":      str(exc),
             },
         )
-
-    except BufferError:
-        # The producer's local queue is full — too many unACKed messages.
-        # flush() drains the queue; then we retry once.
-        logger.warning("producer buffer full — flushing before retry")
-        producer.flush(timeout=10)
-        producer.produce(
-            topic=topic, key=event.kafka_key(),
-            value=event.to_kafka_payload(), callback=_delivery_callback,
-        )
+        raise
 
 
-# =============================================================================
+# ---------------------------------------------------------------------------
 # Operating modes
-# =============================================================================
+# ---------------------------------------------------------------------------
 
-def run_simulate(producer: Producer, interval_sec: float) -> None:
+def mode_simulate(producer: Producer, factory: FakeDataFactory, interval: float) -> None:
     """
-    Infinite loop: produce one random event every `interval_sec` seconds.
-    Exits cleanly on SIGTERM / SIGINT.
+    Infinite loop: emit one weighted-random event every `interval` seconds.
+
+    Loop structure:
+      1. Build event
+      2. produce() — enqueues on background thread
+      3. poll(0)   — drains delivery callbacks WITHOUT blocking
+      4. sleep     — honour SIMULATE_INTERVAL_SEC
+
+    poll(0) vs flush():
+      poll(0) returns immediately after processing any pending callbacks.
+      flush() would block until ALL in-flight messages are delivered —
+      far too slow for a tight loop. We call flush() only on shutdown.
     """
-    logger.info("simulate mode started", extra={"interval_sec": interval_sec})
-    while not _shutdown.is_set():
-        event_type = random.choice(list(EVENT_FACTORIES))
-        event      = EVENT_FACTORIES[event_type]()
+    logger.info(
+        "Producer starting in simulate mode",
+        extra={"interval_sec": interval, "weight_distribution": dict(EVENT_WEIGHTS)},
+    )
+    while not _shutdown:
+        event = factory.random_weighted()
         produce_event(producer, event)
-        _shutdown.wait(timeout=interval_sec)   # interruptible sleep
+        producer.poll(0)
+        time.sleep(interval)
 
-    logger.info("shutting down — flushing producer buffer")
-    producer.flush(timeout=30)
-    logger.info("simulate mode finished", extra=_stats)
+    # Graceful shutdown: deliver anything still buffered
+    logger.info("Flushing in-flight messages before exit")
+    producer.flush(timeout=15)
+    logger.info("Producer shut down cleanly")
 
 
-def run_once(producer: Producer) -> None:
+def mode_once(producer: Producer, factory: FakeDataFactory) -> None:
     """
-    Emit exactly one of each event type (6 messages) then exit.
-    Used by `make produce-once` for smoke tests.
+    Emit exactly one of each event type, then exit.
+
+    Useful for smoke testing (Day 7): confirms all 6 topics accept messages
+    and that each schema validates end-to-end.
+
+    We emit in a logical lifecycle order (new → renewal → cancel → refund
+    → expiry → extension) so the Kafka UI shows a coherent sequence.
     """
-    logger.info("once mode started — emitting one of each event type")
-    for event_type, factory in EVENT_FACTORIES.items():
-        event = factory()
+    lifecycle_order = [
+        "new_subscription",
+        "renewal",
+        "cancellation",
+        "refund",
+        "expiry",
+        "extension",
+    ]
+    logger.info("Producer starting in once mode — emitting one of each event type")
+    for event_type in lifecycle_order:
+        event = factory.build(event_type)
         produce_event(producer, event)
 
-    producer.flush(timeout=30)
-    logger.info("once mode finished", extra=_stats)
-
-
-def run_single(producer: Producer, event_type: str) -> None:
-    """
-    Emit one event of a specific type then exit.
-    Used by `make produce-single EVENT=renewal`.
-    """
-    if event_type not in EVENT_FACTORIES:
-        logger.error(
-            "unknown event type",
-            extra={"event_type": event_type, "valid": list(EVENT_FACTORIES)},
+    # flush() blocks until all 6 messages are ACKed or timeout is reached.
+    # Essential here: the process exits after this function returns, and
+    # any un-flushed messages in the internal queue would be silently dropped.
+    remaining = producer.flush(timeout=15)
+    if remaining > 0:
+        logger.warning(
+            "flush() timed out with messages still in queue",
+            extra={"remaining": remaining},
         )
-        sys.exit(1)
+    else:
+        logger.info("All 6 events delivered successfully")
 
-    logger.info("single mode started", extra={"event_type": event_type})
-    event = EVENT_FACTORIES[event_type]()
+
+def mode_single(producer: Producer, factory: FakeDataFactory, event_type: str) -> None:
+    """
+    Emit exactly one event of the specified type, then exit.
+
+    Used by `make produce-single EVENT=renewal` for targeted testing of
+    specific consumer handlers or state machine transitions.
+    """
+    logger.info(
+        "Producer starting in single mode",
+        extra={"event_type": event_type},
+    )
+    event = factory.build(event_type)
     produce_event(producer, event)
-    producer.flush(timeout=30)
-    logger.info("single mode finished", extra=_stats)
+    remaining = producer.flush(timeout=15)
+    if remaining > 0:
+        logger.warning(
+            "flush() timed out",
+            extra={"remaining": remaining},
+        )
+    else:
+        logger.info("Event delivered", extra={"event_type": event_type})
 
 
-# =============================================================================
+# ---------------------------------------------------------------------------
 # Entry point
-# =============================================================================
+# ---------------------------------------------------------------------------
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="StreamForge Kafka Producer")
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="StreamForge Kafka producer",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Continuous simulation (Docker default)
+  python producer/producer.py --mode simulate
+
+  # One of each event type then exit
+  python producer/producer.py --mode once
+
+  # One specific event then exit
+  python producer/producer.py --mode single --event renewal
+        """,
+    )
     parser.add_argument(
         "--mode",
         choices=["simulate", "once", "single"],
@@ -443,33 +559,41 @@ def main() -> None:
         help="Operating mode (default: simulate)",
     )
     parser.add_argument(
-        "--event-type",
-        default=os.environ.get("EVENT_TYPE", "renewal"),
-        help="Event type for --mode single (also reads EVENT_TYPE env var)",
+        "--event",
+        choices=EVENT_TYPES,
+        default=None,
+        help="Event type for single mode (required when --mode single)",
     )
-    args = parser.parse_args()
+    return parser.parse_args()
 
-    # Config from environment — set in docker-compose or .env
-    bootstrap_servers = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
-    interval_sec      = float(os.environ.get("SIMULATE_INTERVAL_SEC", "1.5"))
+
+def main() -> None:
+    args = parse_args()
+
+    if args.mode == "single" and args.event is None:
+        logger.error("--event is required when --mode is single")
+        sys.exit(1)
+
+    bootstrap = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+    interval  = float(os.getenv("SIMULATE_INTERVAL_SEC", "1.5"))
 
     logger.info(
-        "producer starting",
+        "Initialising Kafka producer",
         extra={
-            "mode":               args.mode,
-            "bootstrap_servers":  bootstrap_servers,
-            "interval_sec":       interval_sec,
+            "bootstrap_servers": bootstrap,
+            "mode":              args.mode,
         },
     )
 
-    producer = build_kafka_producer(bootstrap_servers)
+    producer = _make_producer(bootstrap)
+    factory  = FakeDataFactory()
 
     if args.mode == "simulate":
-        run_simulate(producer, interval_sec)
+        mode_simulate(producer, factory, interval)
     elif args.mode == "once":
-        run_once(producer)
+        mode_once(producer, factory)
     elif args.mode == "single":
-        run_single(producer, args.event_type)
+        mode_single(producer, factory, args.event)
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@
 ## 1. Who I am
 
 - **Role:** Senior Data Engineer, 10+ years experience
-- **Company:** XYS (antivirus company)
+- **Company:** XYZ (antivirus company)
 - **Project name:** StreamForge
 - **Goal:** Build a subscription lifecycle data pipeline end-to-end — locally with Docker first, then migrate to AWS
 
@@ -54,9 +54,9 @@ streamforge/
 │   │   └── logger.py               ✅ Day 5 — structured JSON logging
 │   │
 │   ├── producer/
-│   │   ├── Dockerfile
-│   │   ├── requirements.txt        ← confluent-kafka, faker, pydantic
-│   │   └── producer.py             ← 3 modes: simulate / once / single
+│   │   ├── Dockerfile              ✅ Day 6
+│   │   ├── requirements.txt        ✅ Day 6 — confluent-kafka==2.3.0, faker==24.0.0, pydantic==2.6.1
+│   │   └── producer.py             ✅ Day 6 — 3 modes: simulate / once / single
 │   │
 │   ├── consumer/
 │   │   ├── Dockerfile
@@ -285,7 +285,85 @@ JSON output format:
 
 ---
 
-## 7. State machine design — NOT BUILT (Day 8)
+## 7. Producer service — DONE (Day 6)
+
+### src/producer/producer.py
+
+**Three operating modes** (--mode flag):
+
+| Mode | Trigger | Behaviour |
+|---|---|---|
+| `simulate` | `make up` (default CMD) | Infinite loop, weighted-random event every `SIMULATE_INTERVAL_SEC` |
+| `once` | `make produce-once` | One of each 6 event types in lifecycle order, then exit |
+| `single` | `make produce-single EVENT=renewal` | One specific event type, then exit |
+
+**Weighted event distribution** (mirrors real antivirus SaaS traffic):
+```python
+EVENT_WEIGHTS = [
+    ("renewal",          40),
+    ("new_subscription", 25),
+    ("expiry",           15),
+    ("cancellation",     10),
+    ("refund",            7),
+    ("extension",         3),
+]
+```
+
+**`FakeDataFactory`** — pre-generates a pool of 200 customer/subscription UUID pairs on init. All event builders draw from this pool so simulate mode produces correlated events (renewals reference subs that exist, refunds reference real transaction IDs).
+
+**Deterministic `idempotency_key`:**
+```python
+sha256(f"{subscription_id}|{event_type}|{YYYY-MM-DD}").hexdigest()
+```
+Day-level granularity: same sub + same event type on the same calendar day → same key → consumer deduplicates safely on restart.
+
+**Kafka producer config:**
+```python
+{
+    "bootstrap.servers":  bootstrap_servers,  # from KAFKA_BOOTSTRAP_SERVERS env
+    "acks":               "all",              # all ISR replicas must ACK
+    "retries":            3,                  # auto-retry transient errors
+    "linger.ms":          5,                  # micro-batching for burst throughput
+    "compression.type":   "lz4",             # ~3-5x JSON size reduction
+    "client.id":          "streamforge-producer",
+}
+```
+
+**poll(0) vs flush():**
+- `poll(0)` in simulate loop — drains delivery callbacks without blocking
+- `flush(timeout=15)` on SIGTERM or mode exit — ensures no in-flight messages dropped on clean shutdown
+
+**Graceful shutdown:** SIGTERM/SIGINT handler sets `_shutdown = True` → simulate loop exits → `flush()` drains buffer → process exits cleanly.
+
+**docker-compose producer block:**
+```yaml
+producer:
+  build:
+    context: .
+    dockerfile: src/producer/Dockerfile
+  container_name: sf_producer
+  networks:
+    - streamforge
+  depends_on:
+    kafka:
+      condition: service_healthy
+  environment:
+    KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    SIMULATE_INTERVAL_SEC: ${SIMULATE_INTERVAL_SEC:-1.5}
+  restart: unless-stopped
+```
+
+**New Makefile targets added:**
+```bash
+make produce-once                    # emit one of each event type then exit
+make produce-single EVENT=renewal    # emit one specific event type then exit
+make logs-producer                   # tail producer logs
+```
+
+---
+
+## 8. State machine design — NOT BUILT (Day 8)
 
 ```python
 TRANSITIONS: dict[tuple, str | None] = {
@@ -312,7 +390,7 @@ TRANSITIONS: dict[tuple, str | None] = {
 
 ---
 
-## 8. Consumer design — NOT BUILT (Days 8–11)
+## 9. Consumer design — NOT BUILT (Days 8–11)
 
 Key principles:
 - **Manual offset commit** — commit AFTER successful Postgres write
@@ -326,7 +404,7 @@ Consumer group: `streamforge-etl-v1`
 
 ---
 
-## 9. CS API design — NOT BUILT (Days 15–19)
+## 10. CS API design — NOT BUILT (Days 15–19)
 
 FastAPI. All write actions publish a Kafka event (not direct DB write).
 
@@ -346,7 +424,7 @@ JWT roles: `agent`, `admin`. `performed_by` = `cs_agent:<agent_id>` in lifecycle
 
 ---
 
-## 10. 30-day progress tracker
+## 11. 30-day progress tracker
 
 | Day | Topic | Status |
 |---|---|---|
@@ -355,8 +433,8 @@ JWT roles: `agent`, `admin`. `performed_by` = `cs_agent:<agent_id>` in lifecycle
 | 3 | Docker: Postgres schema + Kafka UI | ✅ Done |
 | 4 | Schema hardening — CHECK + partial indexes | ✅ Done |
 | 5 | src/shared/ — schemas, constants, logger | ✅ Done |
-| 6 | Kafka producer service | ⬜ Next |
-| 7 | End-to-end smoke test | ⬜ |
+| 6 | Kafka producer service | ✅ Done |
+| 7 | End-to-end smoke test | ⬜ Next |
 | 8 | State machine | ⬜ |
 | 9 | Postgres DB layer | ⬜ |
 | 10 | Event handlers | ⬜ |
@@ -383,7 +461,7 @@ JWT roles: `agent`, `admin`. `performed_by` = `cs_agent:<agent_id>` in lifecycle
 
 ---
 
-## 11. Key design decisions
+## 12. Key design decisions
 
 | Decision | Choice | Reason |
 |---|---|---|
@@ -400,10 +478,14 @@ JWT roles: `agent`, `admin`. `performed_by` = `cs_agent:<agent_id>` in lifecycle
 | amount_usd sign | Positive in event, negative in DB | Events are readable; DB convention is money-out = negative |
 | EVENT_TYPE_MAP | dict[str, type[BaseEvent]] | Consumer dispatch without if/elif chains |
 | extra="forbid" | On all event models | Schema drift surfaces immediately, not silently |
+| Idempotency key | sha256(sub_id + event_type + date) | Fixed-length, collision-resistant, restart-safe |
+| Producer UUID pool | FakeDataFactory with 200 entries | Correlated fake data — renewals reference real sub IDs |
+| Producer Kafka config | acks=all, linger.ms=5, lz4 | Durability + micro-batching + compression for burst scale |
+| poll(0) vs flush() | poll(0) in loop, flush() on exit | Non-blocking callbacks in hot path; safe drain on shutdown |
 
 ---
 
-## 12. Local service ports
+## 13. Local service ports
 
 | Service | Port | URL |
 |---|---|---|
@@ -417,7 +499,7 @@ JWT roles: `agent`, `admin`. `performed_by` = `cs_agent:<agent_id>` in lifecycle
 
 ---
 
-## 13. Environment variables (.env.example)
+## 14. Environment variables (.env.example)
 
 ```bash
 KAFKA_BOOTSTRAP_SERVERS=localhost:9092    # host; containers use kafka:29092
@@ -434,72 +516,59 @@ SIMULATE_INTERVAL_SEC=1.5
 
 ---
 
-## 14. Makefile commands
+## 15. Makefile commands
 
 ```bash
 make up               # start all services
 make down             # stop all
 make clean            # stop + delete volumes (resets DB)
 make logs             # follow all logs
-make logs-producer    # producer logs only
+make logs-producer    # producer logs only        ✅ Day 6
 make logs-consumer    # consumer logs only
 make ps               # container statuses
 make db-shell         # psql inside sf_postgres
 make kafka-shell      # bash inside sf_kafka
 make topics           # list all Kafka topics
-make produce-once     # emit one of each event type    ← added Day 6
-make produce-single EVENT=renewal  # one specific event ← added Day 6
+make produce-once     # emit one of each event type    ✅ Day 6
+make produce-single EVENT=renewal  # one specific event ✅ Day 6
 ```
 
 ---
 
-## 15. Day 6 — what to build next
+## 16. Day 7 — what to build next
 
-**`src/producer/`** — Kafka producer service:
+**`scripts/smoke_test.sh`** — end-to-end validation that the full producer → Kafka pipeline works.
 
+**What the smoke test must verify:**
+
+| Check | How |
+|---|---|
+| All 6 topics receive at least 1 message | `make produce-once`, then `kafka-topics --describe` + consumer peek |
+| Each message deserialises correctly | Python script: consume 1 msg per topic, `BaseEvent.from_kafka_payload()` |
+| Partition key is `subscription_id` | Check `msg.key()` matches `event.subscription_id` |
+| Idempotency key is stable across two runs | Run `produce-single EVENT=renewal` twice same day, compare keys |
+| DLQ topics exist and are empty | `kafka-consumer-groups` check, or consume with timeout=1s |
+| Producer exits cleanly (exit code 0) | `make produce-once` → `echo $?` |
+| Kafka UI reachable | `curl -sf http://localhost:8080` |
+| Postgres reachable | `psql $POSTGRES_DSN -c "SELECT 1"` |
+
+**Script structure:**
+```bash
+scripts/smoke_test.sh
+  └── bash with set -euo pipefail
+      ├── check_kafka_ui()
+      ├── check_postgres()
+      ├── produce_once()           # make produce-once, assert exit 0
+      ├── verify_topics()          # all 13 topics exist
+      ├── verify_messages()        # consume 1 msg per main topic, deserialise
+      ├── verify_idempotency()     # two produce-single runs → same key
+      └── print_summary()          # PASS/FAIL per check
 ```
-src/producer/
-├── Dockerfile
-├── requirements.txt   ← confluent-kafka==2.3.0, faker==24.0.0, pydantic==2.x
-└── producer.py        ← 3 modes controlled by --mode flag
-```
 
-**Three operating modes:**
-
-| Mode | Trigger | Behaviour |
-|---|---|---|
-| `simulate` | `make up` (default) | Infinite loop, random event every `SIMULATE_INTERVAL_SEC` |
-| `once` | `make produce-once` | Emit one of each of the 6 event types then exit |
-| `single` | `make produce-single EVENT=renewal` | Emit one specific event type then exit |
-
-**Producer responsibilities:**
-- Import `NewSubscriptionEvent`, `RenewalEvent` etc. from `shared.schemas`
-- Import `TOPIC_MAP` from `shared.constants`
-- Build realistic fake data with `faker` (names, UUIDs, dates, amounts)
-- Call `event.to_kafka_payload()` for value, `event.kafka_key()` for key
-- Set a deterministic `idempotency_key` (not the default uuid4)
-- Use `confluent_kafka.Producer` with delivery callback for error logging
-- Use `get_logger("producer")` from `shared.logger`
-
-**docker-compose addition (uncomment):**
-```yaml
-producer:
-  build:
-    context: .
-    dockerfile: src/producer/Dockerfile
-  networks: [streamforge]
-  depends_on:
-    kafka:
-      condition: service_healthy
-  environment:
-    KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-    LOG_LEVEL: INFO
-    SIMULATE_INTERVAL_SEC: 1.5
-  restart: unless-stopped
-```
+**Helper:** `scripts/verify_messages.py` — thin Python script called by the shell script that consumes one message from each topic and validates schema.
 
 ---
 
-## 16. Prompt to resume in a new chat
+## 17. Prompt to resume in a new chat
 
-> I am a Senior Data Engineer building StreamForge — a real-time subscription lifecycle pipeline at XYS (antivirus company), 300M subscription scale. Here is my full project context: [paste context.md]. Days 1–5 are complete (Docker, Postgres schema, Kafka, schema hardening, shared Python library). Day 6 is next: build the Kafka producer service in src/producer/. Follow the same lesson format: explain each design decision as you build, and give me an updated context.md at the end.
+> I am a Senior Data Engineer building StreamForge — a real-time subscription lifecycle pipeline at XYS (antivirus company), 300M subscription scale. Here is my full project context: [paste context.md]. Days 1–6 are complete (Docker, Postgres schema, Kafka, schema hardening, shared Python library, Kafka producer). Day 7 is next: build scripts/smoke_test.sh. Follow the same lesson format: explain each design decision as you build, and give me an updated context.md at the end.
