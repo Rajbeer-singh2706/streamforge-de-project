@@ -1,0 +1,9 @@
+# confluent-kafka wraps librdkafka — fastest Python Kafka client
+# Pin exact version: a minor bump changed delivery callback signature in 2.2→2.3
+confluent-kafka==2.3.0
+
+# Faker generates realistic fake names, UUIDs, dates, emails
+faker==24.0.0
+
+# Shared schemas import pydantic — version must match shared/
+pydantic>=2.0.0

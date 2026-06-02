@@ -1,12 +1,12 @@
-.PHONY: up down restart logs ps clean db-shell
+.PHONY: start down restart logs ps clean db-shell
 
-up:
+start:
 	docker-compose up -d
 	@echo "Kafka UI → http://localhost:8080"
 
-down:
-	docker-compose down
-
+stop:
+	docker-compose stop
+	
 clean:
 	docker-compose down -v --remove-orphans
 
