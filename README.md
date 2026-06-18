@@ -1,6 +1,16 @@
 ## ## updated
 
 
+StreamForge — Real-Time Subscription Lifecycle Pipeline
+Senior Data Engineer project at XYS (antivirus company). Building a production-grade, end-to-end subscription data pipeline — locally with Docker first, then migrating to AWS.
+Scale: 300M subscriptions, burst traffic of hundreds of thousands of transactions.
+Local stack: Apache Kafka · PostgreSQL · Python · FastAPI · Streamlit
+AWS stack: MSK · Glue (PySpark) · Redshift · S3 · CloudWatch · Terraform
+Pipeline covers 6 subscription lifecycle events: new subscription, renewal, cancellation, refund, expiry, extension — each with its own Kafka topic and DLQ.
+Current progress: Days 1–5 complete (Docker, Kafka, Postgres schema + hardening, shared Python library). Actively building Day 6 onward.
+Always refer to context.md for the full directory structure, schema, design decisions, and day-by-day plan before responding.
+
+
 Purpose & context
  Their primary focus is building StreamForge — a real-time subscription lifecycle data pipeline designed to handle 300 million subscriptions — as a structured personal/side project following a 30-day build plan progressing from local Docker infrastructure toward AWS production deployment.
 Key goals include deepening expertise in event-driven architecture, building a compelling portfolio project, and preparing for technical interviews. Success looks like a production-quality, cloud-deployed pipeline with strong documentation and a well-rounded interview readiness story grounded in StreamForge's specifics.
